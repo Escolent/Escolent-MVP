@@ -1,6 +1,11 @@
 /**
  * Task 1.3: Create skill graph and mastery state database tables.
- * Requirements: 2.1, 2.2, 2.5, 3.2, 3.3
+ * Requirements: 2.1, 2.2, 2.5, 3.2, 3.3, 31.1, 31.6
+ *
+ * `subject` (Requirement 31.1/31.6, design.md's Skill TS interface) was
+ * added after Task 1.3 originally merged, once tasks.md/design.md were
+ * revised to make the Platform explicitly subject-agnostic — see
+ * supabase/migrations/20250101000007_add_skill_subject.sql.
  */
 import { asOwner, closeTestDb } from "../helpers/testDb";
 import {
@@ -22,6 +27,14 @@ describe("skills table", () => {
 
       const skillType = await getColumn(client, "skills", "skill_type");
       expect(skillType).toBeDefined();
+
+      // Used to parameterize LLM tutor prompts (design.md Section 13) and
+      // dashboard grouping, e.g. "Grade 8 Mathematics". Nullable: platform
+      // rows in flight through content authoring may not have it set yet,
+      // and tasks.md doesn't call for a NOT NULL constraint.
+      const subject = await getColumn(client, "skills", "subject");
+      expect(subject?.data_type).toBe("text");
+      expect(subject?.is_nullable).toBe("YES");
 
       const prereqIds = await getColumn(client, "skills", "prerequisite_ids");
       expect(prereqIds?.data_type).toBe("ARRAY");
