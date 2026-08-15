@@ -1,6 +1,6 @@
 # Escolent MVP
 
-Adaptive learning platform (Next.js 14 PWA + Supabase) that tracks mastery,
+Adaptive learning platform (Next.js 14 PWA + Supabase) that builds and tracks mastery,
 not completion. See `requirements.md`, `design.md`, and `tasks.md` for the
 full spec; this README covers day-to-day project setup.
 
