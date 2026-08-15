@@ -28,28 +28,50 @@ export function getAppPool(): Pool {
   return appPool;
 }
 
+export type SetUser = (userId: string | null) => Promise<void>;
+
 /**
- * Runs `fn` inside a transaction on the app (RLS-subject) role, with
- * `auth.uid()` stubbed to resolve to `userId` for the duration — mirroring
- * how PostgREST sets `request.jwt.claims` per-request on Supabase. The
- * transaction is always rolled back afterwards so tests stay isolated from
- * each other. Pass `null` to simulate an unauthenticated request.
+ * Runs `fn` inside a single transaction on the app (RLS-subject) role,
+ * handing it a `setUser` function that stubs `auth.uid()` — mirroring how
+ * PostgREST sets `request.jwt.claims` per-request on Supabase. `setUser` can
+ * be called more than once to switch identity *mid-transaction*: uncommitted
+ * writes made as one user remain visible (per Postgres transaction
+ * semantics) to a later query in the same transaction as a different user,
+ * which is what lets a single test prove "user A's write survives user B's
+ * denied write" without ever committing anything. The transaction is always
+ * rolled back afterwards so tests stay isolated from each other.
+ */
+export async function withAppTransaction<T>(
+  fn: (client: PoolClient, setUser: SetUser) => Promise<T>,
+): Promise<T> {
+  const client = await getAppPool().connect();
+  try {
+    await client.query("BEGIN");
+    const setUser: SetUser = async (userId) => {
+      await client.query("select set_config('request.jwt.claims', $1, true)", [
+        userId ? JSON.stringify({ sub: userId }) : "",
+      ]);
+    };
+    return await fn(client, setUser);
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+}
+
+/**
+ * Convenience wrapper over `withAppTransaction` for the common case of a
+ * single identity for the whole transaction. Pass `null` to simulate an
+ * unauthenticated request.
  */
 export async function asUser<T>(
   userId: string | null,
   fn: (client: PoolClient) => Promise<T>,
 ): Promise<T> {
-  const client = await getAppPool().connect();
-  try {
-    await client.query("BEGIN");
-    await client.query("select set_config('request.jwt.claims', $1, true)", [
-      userId ? JSON.stringify({ sub: userId }) : "",
-    ]);
-    return await fn(client);
-  } finally {
-    await client.query("ROLLBACK").catch(() => undefined);
-    client.release();
-  }
+  return withAppTransaction(async (client, setUser) => {
+    await setUser(userId);
+    return fn(client);
+  });
 }
 
 /** Runs `fn` with the table-owner role (bypasses RLS) — for seeding fixtures. */

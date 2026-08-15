@@ -7,7 +7,7 @@
  * — with `auth.uid()` stubbed per-transaction, so they exercise the actual
  * policies rather than just checking that they exist.
  */
-import { asOwner, asUser, closeTestDb } from "../helpers/testDb";
+import { asOwner, asUser, closeTestDb, withAppTransaction } from "../helpers/testDb";
 import { policyNames, rlsEnabled } from "../helpers/introspect";
 
 afterAll(closeTestDb);
@@ -272,5 +272,182 @@ describe("multi-tenant isolation on core tables", () => {
       client.query("select id from tenants where id = $1", [fx.tenantB]).then((r) => r.rows),
     );
     expect(other).toHaveLength(0);
+  });
+});
+
+describe("additional negative-path RLS enforcement", () => {
+  let fx: Fixture;
+  let teacherA2: string;
+  let spaceOwnedByTeacherA: string;
+  let sessionA: string;
+  let misconceptionA: string;
+
+  beforeAll(async () => {
+    fx = await seedFixture();
+
+    await asOwner(async (client) => {
+      const suffix = Date.now();
+
+      const { rows: teacherRows } = await client.query(
+        `insert into users (tenant_id, email) values ($1, $2) returning id`,
+        [fx.tenantA, `teacher-a2-${suffix}@test.com`],
+      );
+      teacherA2 = teacherRows[0].id;
+      await client.query(`insert into user_roles (user_id, role, tenant_id) values ($1, 'teacher', $2)`, [
+        teacherA2,
+        fx.tenantA,
+      ]);
+
+      const { rows: spaceRows } = await client.query(
+        `insert into spaces (name, teacher_id, tenant_id, included_skill_ids, difficulty_range)
+         values ('Teacher A''s Space', $1, $2, $3, '{1,5}') returning id`,
+        [fx.teacherA, fx.tenantA, [fx.skillA]],
+      );
+      spaceOwnedByTeacherA = spaceRows[0].id;
+
+      const { rows: sessionRows } = await client.query(
+        `insert into sessions (student_id, status, tenant_id) values ($1, 'active', $2) returning id`,
+        [fx.studentA, fx.tenantA],
+      );
+      sessionA = sessionRows[0].id;
+
+      const { rows: misconceptionRows } = await client.query(
+        `insert into misconceptions (name, skill_id, error_pattern, tenant_id)
+         values ('Existing misconception', $1, '{"type":"regex","pattern":"x"}', $2) returning id`,
+        [fx.skillA, fx.tenantA],
+      );
+      misconceptionA = misconceptionRows[0].id;
+    });
+  });
+
+  // 1. Teacher writing to another teacher's Space in the SAME tenant.
+  it("denies a Teacher from writing to a Space owned by a different Teacher in the same tenant", async () => {
+    await asUser(teacherA2, async (client) => {
+      const renamed = await client.query("update spaces set name = 'Hijacked' where id = $1", [
+        spaceOwnedByTeacherA,
+      ]);
+      expect(renamed.rowCount).toBe(0); // filtered by teacher_id = auth.uid(), not an error
+
+      // Not even visible for read — spaces has no tenant-wide teacher SELECT policy.
+      const seen = await client
+        .query("select id from spaces where id = $1", [spaceOwnedByTeacherA])
+        .then((r) => r.rows);
+      expect(seen).toHaveLength(0);
+    });
+
+    // Confirm the space was in fact untouched.
+    const stillOriginal = await asOwner((client) =>
+      client.query("select name from spaces where id = $1", [spaceOwnedByTeacherA]).then((r) => r.rows[0]),
+    );
+    expect(stillOriginal.name).toBe("Teacher A's Space");
+  });
+
+  // 2. Student writing to skills / misconceptions. Each assertion runs in
+  // its own transaction: a rejected statement aborts the rest of its
+  // transaction in Postgres, so a second query after a caught rejection
+  // would only prove "the transaction is broken," not "RLS denied it."
+  it("denies a Student any write access to skills or misconceptions", async () => {
+    await asUser(fx.studentA, (client) =>
+      expect(
+        client.query(
+          `insert into skills (name, skill_type, tenant_id) values ('Forged skill', 'procedural', $1)`,
+          [fx.tenantA],
+        ),
+      ).rejects.toThrow(/row-level security/i),
+    );
+
+    await asUser(fx.studentA, (client) =>
+      expect(
+        client.query(
+          `insert into misconceptions (name, skill_id, error_pattern, tenant_id)
+           values ('Forged misconception', $1, '{"type":"regex","pattern":"x"}', $2)`,
+          [fx.skillA, fx.tenantA],
+        ),
+      ).rejects.toThrow(/row-level security/i),
+    );
+
+    await asUser(fx.studentA, async (client) => {
+      const skillUpdate = await client.query("update skills set name = 'Hijacked' where id = $1", [
+        fx.skillA,
+      ]);
+      expect(skillUpdate.rowCount).toBe(0);
+    });
+
+    await asUser(fx.studentA, async (client) => {
+      const misconceptionUpdate = await client.query(
+        "update misconceptions set content_status = 'validated' where id = $1",
+        [misconceptionA],
+      );
+      expect(misconceptionUpdate.rowCount).toBe(0);
+    });
+  });
+
+  // 3. Pedagogical_Lead's read access is confined to skills/misconceptions/unmatched_errors.
+  it("denies Pedagogical_Lead any access to mastery_states or sessions", async () => {
+    const masteryRows = await asUser(fx.pedagogicalLead, (client) =>
+      client.query("select student_id from mastery_states").then((r) => r.rows),
+    );
+    expect(masteryRows).toHaveLength(0);
+
+    const sessionRows = await asUser(fx.pedagogicalLead, (client) =>
+      client.query("select id from sessions").then((r) => r.rows),
+    );
+    expect(sessionRows).toHaveLength(0);
+
+    // Sanity check the flip side, so this test would fail loudly if the
+    // curated-content policies ever regressed too.
+    const skillRows = await asUser(fx.pedagogicalLead, (client) =>
+      client.query("select id from skills where id = $1", [fx.skillA]).then((r) => r.rows),
+    );
+    expect(skillRows).toHaveLength(1);
+  });
+
+  // 4. Admin cross-tenant WRITE (not just read).
+  it("denies an Admin from writing to another tenant's sessions", async () => {
+    const { rows: adminBRows } = await asOwner((client) =>
+      client.query(
+        `insert into users (tenant_id, email) values ($1, $2) returning id`,
+        [fx.tenantB, `admin-b-${Date.now()}@test.com`],
+      ),
+    );
+    const adminB = adminBRows[0].id as string;
+    await asOwner((client) =>
+      client.query(`insert into user_roles (user_id, role, tenant_id) values ($1, 'admin', $2)`, [
+        adminB,
+        fx.tenantB,
+      ]),
+    );
+
+    // All in one transaction (rolled back at the end, per usual) so adminA's
+    // write is visible to the later checks without needing to commit it —
+    // `asUser` alone can't do this since each call is its own
+    // begin/rollback pair.
+    await withAppTransaction(async (client, setUser) => {
+      await setUser(fx.adminA);
+      // adminA belongs to tenantA; sessionA also belongs to tenantA, so this
+      // control case must succeed — otherwise the denial below would be
+      // meaningless (could just be that admins can never write sessions).
+      const ownTenantUpdate = await client.query(
+        "update sessions set status = 'paused' where id = $1",
+        [sessionA],
+      );
+      expect(ownTenantUpdate.rowCount).toBe(1);
+
+      // Now the actual cross-tenant case: an Admin belonging to tenant B
+      // attempting to write a tenant A session.
+      await setUser(adminB);
+      const crossTenantUpdate = await client.query(
+        "update sessions set status = 'expired' where id = $1",
+        [sessionA],
+      );
+      expect(crossTenantUpdate.rowCount).toBe(0);
+
+      // Confirm, back as adminA, that the cross-tenant attempt did not stick.
+      await setUser(fx.adminA);
+      const finalStatus = await client
+        .query("select status from sessions where id = $1", [sessionA])
+        .then((r) => r.rows[0]);
+      expect(finalStatus.status).toBe("paused");
+    });
   });
 });
