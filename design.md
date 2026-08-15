@@ -4,7 +4,9 @@
 
 ### System Purpose
 
-Escolent MVP is an AI-native adaptive learning platform targeting Grade 8 Mathematics (IEB-aligned algebraic equations). The platform embeds within existing LMS ecosystems (Canvas, Moodle, Google Classroom) to provide adaptive, personalized practice with honest mastery tracking. The core value proposition: schools currently track completion rather than mastery—students can finish exercises without understanding the material. Escolent shifts the metric from "work completed" to "concepts mastered."
+Escolent MVP is a subject-agnostic, AI-native adaptive learning platform. The platform embeds within existing LMS ecosystems (Canvas, Moodle, Google Classroom) to provide adaptive, personalized practice with honest mastery tracking, for any subject a school teaches. The core value proposition: schools currently track completion rather than mastery—students can finish exercises without understanding the material. Escolent shifts the metric from "work completed" to "concepts mastered."
+
+The subject-agnostic mechanisms below (Skill Graph, Knowledge Tracing, Misconception Detection, pluggable evaluation — Section 14) are validated end-to-end against one initial subject and curriculum for the MVP pilot: Grade 8 Mathematics, IEB-aligned algebraic equations. See Section 14 for how a second subject is added without architectural rework.
 
 ### Target Deployment Context
 
@@ -207,7 +209,7 @@ USING (
 
 ### 2. Skill Graph and Prerequisite System
 
-**Purpose:** Represent IEB Grade 8 algebra skills as a directed acyclic graph (DAG) with prerequisite dependencies, enabling prerequisite-aware remediation.
+**Purpose:** Represent the Skills of any subject/curriculum configured on the Platform as a directed acyclic graph (DAG) with prerequisite dependencies, enabling prerequisite-aware remediation. Populated for the MVP pilot with IEB Grade 8 algebra skills (see Requirement 33 / tasks.md Task 1 for initial content load).
 
 **Data Structure:**
 
@@ -216,6 +218,7 @@ interface Skill {
   id: string;              // UUID
   name: string;            // e.g., "Solving one-step linear equations"
   description: string;     // Plain-language explanation
+  subject: string;         // e.g., "Grade 8 Mathematics" — used to parameterize LLM prompts/tutor voice (Section 13) and dashboard grouping
   skill_type: 'procedural' | 'conceptual'; // Determines mastery threshold
   prerequisite_ids: string[];  // Array of prerequisite skill IDs (DAG edge)
   tenant_id: string | null;    // null = platform-level, else school-specific
@@ -302,7 +305,7 @@ interface ResponseRecord {
 
 ### 4. Misconception Detection and Remediation System
 
-**Purpose:** Identify specific mathematical misconceptions (not just "wrong answers") and provide targeted remediation.
+**Purpose:** Identify specific misconceptions within a subject (not just "wrong answers") and provide targeted remediation. Populated for the MVP pilot with Grade 8 algebra misconceptions (Task 25.2).
 
 **Misconception Taxonomy Structure:**
 
@@ -794,17 +797,19 @@ export const generateResponse = async (prompt: string) => {
 ```
 
 
-**Prompt Templates (Provider-Agnostic):**
+**Prompt Templates (Provider-Agnostic, Subject-Agnostic):**
 
 ```typescript
-// No pedagogy embedded in prompts - all instructional logic in code
+// No pedagogy embedded in prompts - all instructional logic in code.
+// Subject and skill are parameters, not fixed text, so the same template
+// serves any subject the Platform is configured with (Requirement 31).
 const socraticPromptTemplate = (context: LLMContext, studentError: string) => `
-You are a Grade 8 mathematics tutor. The student is learning: ${context.skill.name}.
+You are a tutor for ${context.skill.subject}. The student is learning: ${context.skill.name}.
 The student's current mastery level is ${context.student_mastery * 100}%.
 The student provided this incorrect answer: "${studentError}"
 
 Provide a Socratic-style hint that guides the student to discover the error without giving the answer directly.
-Keep the response under 50 words, suitable for a Grade 8 student.
+Keep the response under 50 words, in language appropriate for this subject and grade level.
 `;
 ```
 
