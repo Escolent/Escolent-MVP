@@ -20,6 +20,10 @@ const withPWA = withPWAInit({
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // `jose` (LTI/Google ID token verification, task 3.1) ships ESM-only.
+  // Next's bundler and next/jest's transformIgnorePatterns both read this
+  // list to know which node_modules packages still need transforming.
+  transpilePackages: ["jose"],
 };
 
 export default withPWA(nextConfig);
